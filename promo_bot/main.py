@@ -1,166 +1,235 @@
 import os
 import asyncio
-import logging
-import tempfile
-from typing import List
+from io import BytesIO
 
-import pandas as pd
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command
-from aiogram.types import FSInputFile
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message
 from aiohttp import web
 
+import pandas as pd
+
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.lib.colors import black
+
+from PyPDF2 import PdfReader, PdfWriter
 
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-# --------------------------
-
-# ---------- TELEGRAM ----------
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # из Render → Environment
+# ================== НАСТРОЙКИ ==================
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-# ------------------------------
+
+# Шрифт: или встроенный Helvetica-Bold, или подключаем TTF.
+FONT_NAME = "Helvetica-Bold"
+FONT_TTF  = None  # например: "fonts/DejaVuSans-Bold.ttf"
+TEXT_COLOR = black
+
+# Прямоугольник под словом PROMOCODE (в долях ширины/высоты страницы)
+BOX = dict(x=0.10, y=0.37, w=0.80, h=0.13)
+
+# Память на пользователя: последние загруженные Template и Codes
+USER_STATE = {}  # user_id -> {"template": bytes, "codes": [..]}
+
+# =================================================
 
 
-# ---------- /start /help ----------
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    text = (
-        "Привет! Я соберу PDF с промо-картами.\n\n"
-        "Отправь мне Excel (.xlsx) c колонкой `code` (или `код`). "
-        "Если такой колонки нет — возьму первую колонку.\n\n"
-        "Команды:\n"
-        "• /help — короткая справка"
-    )
-    await message.answer(text)
+# ---------- сервис: регистрация шрифта -----------
+def ensure_font():
+    global FONT_NAME
+    if FONT_TTF:
+        try:
+            pdfmetrics.registerFont(TTFont("CustomFont", FONT_TTF))
+            FONT_NAME = "CustomFont"
+        except Exception as e:
+            print(f"[FONT] Не удалось подключить TTF ({FONT_TTF}): {e}. Использую Helvetica-Bold.")
 
 
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "1) Пришли Excel (.xlsx) с кодами (колонка `code`/`код`/первая колонка)\n"
-        "2) Я верну PDF: по одной карточке на страницу."
-    )
-# ----------------------------------
+# ---------- автоподбор размера шрифта ------------
+def fit_font_size(text, box_w_pt, box_h_pt, font_name):
+    lo, hi = 4, 300
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        width = stringWidth(text, font_name, mid)
+        if width <= box_w_pt and mid <= box_h_pt:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
-# ---------- ГЕНЕРАЦИЯ PDF ----------
-FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf")
-FONT_NAME = "DejaVuSansBold"
+# ---------- рисуем одну страницу-оверлей ---------
+def make_overlay(page_w, page_h, code_text):
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_w, page_h))
+    c.setFillColor(TEXT_COLOR)
+    c.setStrokeColor(TEXT_COLOR)
 
-def ensure_font_registered():
-    if FONT_NAME not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+    # прямоугольник в пунктах
+    box_x = BOX["x"] * page_w
+    box_y = BOX["y"] * page_h
+    box_w = BOX["w"] * page_w
+    box_h = BOX["h"] * page_h
 
-def build_pdf(codes: List[str], out_path: str):
-    """Простой вариант: 1 код = 1 страница, код по центру."""
-    ensure_font_registered()
-    c = canvas.Canvas(out_path, pagesize=A4)
-    w, h = A4
-    c.setFont(FONT_NAME, 48)
+    font_size = fit_font_size(code_text, box_w, box_h, FONT_NAME)
+    c.setFont(FONT_NAME, font_size)
+
+    text_w = stringWidth(code_text, FONT_NAME, font_size)
+    x = box_x + (box_w - text_w) / 2.0
+    y = box_y + (box_h - font_size) / 2.0
+
+    c.drawString(x, y, code_text)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return PdfReader(buf).pages[0]
+
+
+# ---------- сборка итогового PDF ------------------
+def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
+    tpl = PdfReader(BytesIO(template_bytes))
+    base_page = tpl.pages[0]
+    page_w = float(base_page.mediabox.width)
+    page_h = float(base_page.mediabox.height)
+
+    writer = PdfWriter()
 
     for code in codes:
-        code_str = str(code).strip()
-        if not code_str:
-            continue
-        c.drawCentredString(w / 2, h / 2, code_str)
-        c.showPage()
+        # новый экземпляр базовой страницы (важно не мутировать исходную)
+        page = PdfReader(BytesIO(template_bytes)).pages[0]
+        overlay_page = make_overlay(page_w, page_h, str(code).strip())
+        page.merge_page(overlay_page)
+        writer.add_page(page)
 
-    c.save()
-# -----------------------------------
+    out = BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.read()
 
 
-# ---------- ПРИЁМ EXCEL ФАЙЛОВ ----------
-def pick_codes_column(df: pd.DataFrame) -> List[str]:
-    cols_lower = {col.lower(): col for col in df.columns}
-    for candidate in ("code", "код"):
-        if candidate in cols_lower:
-            return df[cols_lower[candidate]].astype(str).fillna("").tolist()
-    # если спец-колонок нет — взять первую
-    first_col = df.columns[0]
-    return df[first_col].astype(str).fillna("").tolist()
+# ---------- чтение Excel / CSV --------------------
+def read_codes_from_bytes(file_name: str, raw: bytes) -> list[str]:
+    name = (file_name or "").lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(BytesIO(raw), dtype=str)
+    else:
+        # xlsx/xls/неизвестно — пробуем как Excel
+        df = pd.read_excel(BytesIO(raw), dtype=str)
+
+    # ищем столбец code/код или берём первый непустой
+    cols = [c for c in df.columns]
+    col_name = None
+    for cand in cols:
+        lc = str(cand).strip().lower()
+        if lc in {"code", "код", "promocode", "promo", "коды", "codes"}:
+            col_name = cand
+            break
+    if col_name is None:
+        # берём первый столбец
+        col_name = cols[0]
+
+    series = df[col_name].dropna().astype(str).str.strip()
+    codes = [s for s in series.tolist() if s]
+    # убираем дубликаты, сохраняя порядок
+    seen = set()
+    uniq = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+# ================== HANDLERS ======================
+@dp.message(CommandStart())
+async def on_start(m: Message):
+    await m.answer(
+        "Привет! Пришли мне два файла:\n"
+        "1) PDF-шаблон (страница с PROMOCODE)\n"
+        "2) Excel/CSV с промокодами (столбец code/код или просто первый столбец)\n\n"
+        "Как только оба файла получу — соберу и вышлю итоговый PDF."
+    )
 
 
 @dp.message(F.document)
-async def handle_document(message: types.Message):
-    doc: types.Document = message.document
-    filename = (doc.file_name or "").lower()
+async def on_document(m: Message):
+    user_id = m.from_user.id
+    doc = m.document
+    file_name = doc.file_name or ""
 
-    if not filename.endswith(".xlsx"):
-        await message.answer("Пришлите, пожалуйста, *Excel* файл с расширением `.xlsx`.", parse_mode="Markdown")
+    # скачиваем байты
+    buf = BytesIO()
+    try:
+        # aiogram v3 умеет так:
+        await bot.download(doc, destination=buf)
+    except Exception:
+        # запасной путь через file_path
+        try:
+            tg_file = await bot.get_file(doc.file_id)
+            await bot.download_file(tg_file.file_path, buf)
+        except Exception as e:
+            await m.reply(f"Не удалось скачать файл: {e}")
+            return
+    raw = buf.getvalue()
+
+    state = USER_STATE.setdefault(user_id, {"template": None, "codes": None})
+
+    if (doc.mime_type or "").lower() == "application/pdf" or file_name.lower().endswith(".pdf"):
+        state["template"] = raw
+        await m.reply("Шаблон PDF сохранён ✅")
+    elif any(file_name.lower().endswith(ext) for ext in (".xlsx", ".xls", ".csv")):
+        try:
+            codes = read_codes_from_bytes(file_name, raw)
+            if not codes:
+                await m.reply("В этом файле не нашёл ни одного кода 😕")
+                return
+            state["codes"] = codes
+            await m.reply(f"Файл с кодами сохранён ✅\nНайдено кодов: {len(codes)}")
+        except Exception as e:
+            await m.reply(f"Не смог прочитать коды: {e}")
+            return
+    else:
+        await m.reply("Мне нужен PDF (шаблон) или Excel/CSV (коды).")
         return
 
-    await message.answer("Файл получил, обрабатываю…")
-
-    # Временная папка на диске
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_path = os.path.join(tmpdir, "input.xlsx")
-        out_pdf = os.path.join(tmpdir, "promo_cards.pdf")
-
-        # Скачиваем файл
-        file = await bot.get_file(doc.file_id)
-        await bot.download(file, destination=src_path)
-
-        # Читаем Excel
+    # если есть оба — генерим
+    if state.get("template") and state.get("codes"):
+        await m.reply("Собираю итоговый PDF… ⏳")
         try:
-            df = pd.read_excel(src_path, dtype=str)
+            ensure_font()
+            out_bytes = build_pdf(state["template"], state["codes"])
+            out = BytesIO(out_bytes)
+            out.name = "promo_cards.pdf"
+            await m.answer_document(types.BufferedInputFile(out.getvalue(), filename="promo_cards.pdf"))
+            # сбрасываем состояние (чтобы следующий запуск был чистым)
+            USER_STATE[user_id] = {"template": None, "codes": None}
         except Exception as e:
-            logger.exception("Ошибка чтения Excel: %s", e)
-            await message.answer("Не удалось прочитать Excel. Убедитесь, что это .xlsx и файл не повреждён.")
-            return
-
-        if df.empty or len(df.columns) == 0:
-            await message.answer("В Excel нет данных. Нужна хотя бы одна колонка с кодами.")
-            return
-
-        codes = pick_codes_column(df)
-        codes = [c for c in codes if str(c).strip()]
-        if not codes:
-            await message.answer("Кодов не нашёл. Проверьте колонку `code`/`код` или первую колонку.")
-            return
-
-        # Генерируем PDF
-        try:
-            build_pdf(codes, out_pdf)
-        except Exception as e:
-            logger.exception("Ошибка генерации PDF: %s", e)
-            await message.answer("Что-то пошло не так при сборке PDF 😔")
-            return
-
-        # Отправляем пользователю
-        await message.answer_document(
-            FSInputFile(out_pdf),
-            caption=f"Готово! Сформировано {len(codes)} страниц(ы) с кодами.",
-        )
-# ---------------------------------------
+            await m.reply(f"Упс, не собралось: {e}")
 
 
-# ---------- ВЕБ-ПИНГ ДЛЯ RENDER ----------
-async def ping_handler(_request: web.Request):
-    logger.info("✅ Ping received")
+# ============ Веб-сервер для Render Free ==========
+async def handle(request):
     return web.Response(text="Bot is alive!")
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get("/", ping_handler)
+    app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "5000")))
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 5000)))
     await site.start()
-# ----------------------------------------
 
 
-# ---------- ЗАПУСК ----------
+# ================== ENTRYPOINT ====================
 async def main():
+    ensure_font()
     await start_web_server()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-# ---------------------------
