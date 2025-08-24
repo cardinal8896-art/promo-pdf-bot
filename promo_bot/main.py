@@ -97,7 +97,7 @@ def make_overlay(page_w, page_h, code_text):
 
 # ---------- сборка итогового PDF ------------------
 def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
-    # читаем шаблон 1 раз, берём размеры первой страницы
+    # читаем шаблон (только для извлечения размеров)
     tpl_reader = PdfReader(BytesIO(template_bytes))
     base_page = tpl_reader.pages[0]
     page_w = float(base_page.mediabox.width)
@@ -106,17 +106,21 @@ def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
     writer = PdfWriter()
 
     for code in codes:
-        # 1) создаём «чистую» страницу нужного размера в итоговом документе
-        blank = writer.add_blank_page(width=page_w, height=page_h)
+        # 1) каждый раз перечитываем страницу шаблона как отдельный объект
+        bg_reader = PdfReader(BytesIO(template_bytes))
+        bg_page = bg_reader.pages[0]
 
-        # 2) кладём на неё фон (шаблон)
-        #    Важно: берём страницу из нового ридера, чтобы не мутировать один объект много раз
-        bg = PdfReader(BytesIO(template_bytes)).pages[0]
-        blank.merge_page(bg)
+        # 2) кладём в выходной документ именно СТРАНИЦУ ШАБЛОНА
+        writer.add_page(bg_page)
 
-        # 3) генерим оверлей с кодом и кладём поверх
+        # 3) берём «живую» ссылку на только что добавленную страницу в writer
+        out_page = writer.pages[-1]
+
+        # 4) генерим оверлей с кодом под размер страницы
         overlay_page = make_overlay(page_w, page_h, str(code).strip())
-        blank.merge_page(overlay_page)
+
+        # 5) накладываем код поверх
+        out_page.merge_page(overlay_page)
 
     out = BytesIO()
     writer.write(out)
