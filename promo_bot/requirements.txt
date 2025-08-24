@@ -1,7 +1,6 @@
-aiogram>=3.5,<4
+aiogram>=3.2
 aiohttp>=3.9
+reportlab>=4.0
+PyPDF2>=3.0
 pandas>=2.2
 openpyxl>=3.1
-reportlab>=4.2
-pypdf>=4.2
-python-dotenv>=1.0
