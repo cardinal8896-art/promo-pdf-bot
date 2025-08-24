@@ -1,8 +1,14 @@
 import os
 import asyncio
+import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiohttp import web  # добавляем aiohttp для веб-сервера
+
+# ---------- Логирование ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+# ---------------------------------
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")  # токен из переменных окружения на Render
 bot = Bot(token=TOKEN)
@@ -14,6 +20,7 @@ async def start(message: types.Message):
 
 # ---------- Веб-сервер ----------
 async def handle(request):
+    logger.info("✅ Ping received from UptimeRobot")
     return web.Response(text="Bot is alive!")
 
 async def start_web_server():
