@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: promo-pdf-bot
+    env: python
+    buildCommand: pip install -r promo_bot/requirements.txt
+    startCommand: python promo_bot/main.py
+    autoDeploy: true
