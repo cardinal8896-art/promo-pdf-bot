@@ -1,0 +1,1 @@
+worker: python promo_bot/main.py
