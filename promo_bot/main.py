@@ -97,35 +97,72 @@ def make_overlay(page_w, page_h, code_text):
 
 # ---------- сборка итогового PDF ------------------
 def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
-    # читаем шаблон (только для извлечения размеров)
-    tpl_reader = PdfReader(BytesIO(template_bytes))
-    base_page = tpl_reader.pages[0]
-    page_w = float(base_page.mediabox.width)
-    page_h = float(base_page.mediabox.height)
+    """
+    Надёжная сборка через PyMuPDF:
+    - на каждую страницу выводим шаблон;
+    - поверх выводим промокод, подгоняя размер шрифта в BOX.
+    """
+    tpl = fitz.open(stream=template_bytes, filetype="pdf")
+    if tpl.page_count == 0:
+        raise ValueError("Пустой PDF-шаблон")
 
-    writer = PdfWriter()
+    page0 = tpl[0]
+    page_w, page_h = page0.rect.width, page0.rect.height
+
+    out = fitz.open()
+
+    # Подготовим шрифт
+    if FONT_TTF:
+        # регистрируем TTF и используем его
+        fontname = out.insert_font(file=FONT_TTF)
+    else:
+        # встроенный Helvetica (helv)
+        fontname = "helv"
+
+    def fit_font_size_fitz(text, bw, bh):
+        lo, hi = 4, 300
+        best = lo
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            width = out.get_text_length(text, fontname=fontname, fontsize=mid)
+            if width <= bw and mid <= bh:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    # координаты «бокса» под код
+    box_x = BOX["x"] * page_w
+    box_y = BOX["y"] * page_h
+    box_w = BOX["w"] * page_w
+    box_h = BOX["h"] * page_h
 
     for code in codes:
-        # 1) каждый раз перечитываем страницу шаблона как отдельный объект
-        bg_reader = PdfReader(BytesIO(template_bytes))
-        bg_page = bg_reader.pages[0]
+        # 1) новая страница нужного размера
+        p = out.new_page(width=page_w, height=page_h)
+        # 2) рисуем на неё шаблон
+        p.show_pdf_page(p.rect, tpl, 0)
 
-        # 2) кладём в выходной документ именно СТРАНИЦУ ШАБЛОНА
-        writer.add_page(bg_page)
+        # 3) рассчитываем размер шрифта и позицию
+        text = str(code).strip()
+        fs = fit_font_size_fitz(text, box_w, box_h)
+        text_w = out.get_text_length(text, fontname=fontname, fontsize=fs)
 
-        # 3) берём «живую» ссылку на только что добавленную страницу в writer
-        out_page = writer.pages[-1]
+        x = box_x + (box_w - text_w) / 2.0
+        # в PyMuPDF y — это БАЗОВАЯ линия; чтобы центрировать по высоте «бокса»:
+        y = box_y + (box_h + fs) / 2.0
 
-        # 4) генерим оверлей с кодом под размер страницы
-        overlay_page = make_overlay(page_w, page_h, str(code).strip())
+        # 4) печатаем код (чёрным)
+        p.insert_text(
+            fitz.Point(x, y),
+            text,
+            fontname=fontname,
+            fontsize=fs,
+            color=(0, 0, 0),  # black
+        )
 
-        # 5) накладываем код поверх
-        out_page.merge_page(overlay_page)
-
-    out = BytesIO()
-    writer.write(out)
-    out.seek(0)
-    return out.read()
+    return out.tobytes()
 
 
 # ---------- чтение Excel / CSV --------------------
