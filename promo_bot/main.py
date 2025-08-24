@@ -16,6 +16,8 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import black
 
 from PyPDF2 import PdfReader, PdfWriter
+import fitz  # PyMuPDF
+
 
 
 # ================== НАСТРОЙКИ ==================
