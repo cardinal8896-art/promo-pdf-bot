@@ -98,24 +98,26 @@ def make_overlay(page_w, page_h, code_text):
 
 
 # ---------- сборка итогового PDF ------------------
- def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes: 
- tpl = PdfReader(BytesIO(template_bytes)) 
- base_page = tpl.pages[0] 
- page_w = float(base_page.mediabox.width) 
- page_h = float(base_page.mediabox.height) 
- 
- writer = PdfWriter() 
- for code in codes: 
- # новый экземпляр базовой страницы (важно не мутировать исходную) 
- page = PdfReader(BytesIO(template_bytes)).pages[0] 
- overlay_page = make_overlay(page_w, page_h, str(code).strip()) 
- page.merge_page(overlay_page) 
- writer.add_page(page) 
- 
- out = BytesIO() 
- writer.write(out) 
- out.seek(0) 
- return out.read()
+def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
+    tpl = PdfReader(BytesIO(template_bytes))
+    base_page = tpl.pages[0]
+    page_w = float(base_page.mediabox.width)
+    page_h = float(base_page.mediabox.height)
+
+    writer = PdfWriter()
+
+    for code in codes:
+        # новый экземпляр базовой страницы (важно не мутировать исходную)
+        page = PdfReader(BytesIO(template_bytes)).pages[0]
+        overlay_page = make_overlay(page_w, page_h, str(code).strip())
+        page.merge_page(overlay_page)
+        writer.add_page(page)
+
+    out = BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.read()
+
 
 # ---------- чтение Excel / CSV --------------------
 def read_codes_from_bytes(file_name: str, raw: bytes) -> list[str]:
