@@ -1,6 +1,7 @@
 import os
 import asyncio
 from io import BytesIO
+import zipfile
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -16,8 +17,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import black
 
 from PyPDF2 import PdfReader, PdfWriter
-
-
+import fitz  # PyMuPDF
 
 
 # ================== НАСТРОЙКИ ==================
@@ -33,15 +33,13 @@ TEXT_COLOR = black
 # Прямоугольник под словом PROMOCODE (в долях ширины/высоты страницы)
 BOX = dict(
     x=0.10,   # ширину не трогаем
-    y=0.150,  # было 0.37 → опустили ниже (если нужно ещё ниже — уменьшайте)
+    y=0.150,  # ниже слова PROMOCODE; регулируй при необходимости
     w=0.80,
-    h=0.050   # было 0.13 → делаем ниже бокс, значит и шрифт станет меньше
+    h=0.050   # ниже бокс → меньше шрифт
 )
 
-# Память на пользователя: последние загруженные Template и Codes
+# Память на пользователя
 USER_STATE = {}  # user_id -> {"template": bytes, "codes": [..]}
-
-# =================================================
 
 
 # ---------- сервис: регистрация шрифта -----------
@@ -107,7 +105,7 @@ def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
     writer = PdfWriter()
 
     for code in codes:
-        # новый экземпляр базовой страницы (важно не мутировать исходную)
+        # берём исходную страницу шаблона 1:1
         page = PdfReader(BytesIO(template_bytes)).pages[0]
         overlay_page = make_overlay(page_w, page_h, str(code).strip())
         page.merge_page(overlay_page)
@@ -119,13 +117,37 @@ def build_pdf(template_bytes: bytes, codes: list[str]) -> bytes:
     return out.read()
 
 
+# ---------- PDF -> ZIP с PNG ----------------------
+def pdf_to_png_zip(pdf_bytes: bytes, dpi: int = 300) -> bytes:
+    """
+    Конвертирует все страницы PDF в PNG и пакует их в ZIP.
+    dpi 150-300 — нормально. Чем выше, тем тяжелее архив.
+    """
+    # открываем PDF из памяти
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    zip_buf = BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            # рендер
+            mat = fitz.Matrix(dpi/72, dpi/72)  # 72 pt/inch базовый, умножаем на dpi
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_buf = BytesIO(pix.tobytes("png"))
+            # аккуратные имена файлов
+            name = f"card_{i+1:03}.png"
+            zf.writestr(name, img_buf.getvalue())
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
 # ---------- чтение Excel / CSV --------------------
 def read_codes_from_bytes(file_name: str, raw: bytes) -> list[str]:
     name = (file_name or "").lower()
     if name.endswith(".csv"):
         df = pd.read_csv(BytesIO(raw), dtype=str)
     else:
-        # xlsx/xls/неизвестно — пробуем как Excel
         df = pd.read_excel(BytesIO(raw), dtype=str)
 
     # ищем столбец code/код или берём первый непустой
@@ -137,11 +159,11 @@ def read_codes_from_bytes(file_name: str, raw: bytes) -> list[str]:
             col_name = cand
             break
     if col_name is None:
-        # берём первый столбец
         col_name = cols[0]
 
     series = df[col_name].dropna().astype(str).str.strip()
     codes = [s for s in series.tolist() if s]
+
     # убираем дубликаты, сохраняя порядок
     seen = set()
     uniq = []
@@ -158,8 +180,8 @@ async def on_start(m: Message):
     await m.answer(
         "Привет! Пришли мне два файла:\n"
         "1) PDF-шаблон (страница с PROMOCODE)\n"
-        "2) Excel/CSV с промокодами (столбец code/код или просто первый столбец)\n\n"
-        "Как только оба файла получу — соберу и вышлю итоговый PDF."
+        "2) Excel/CSV с промокодами (столбец code/код или первый столбец)\n\n"
+        "Как только оба файла получу — соберу архив PNG-карточек и пришлю."
     )
 
 
@@ -172,10 +194,8 @@ async def on_document(m: Message):
     # скачиваем байты
     buf = BytesIO()
     try:
-        # aiogram v3 умеет так:
         await bot.download(doc, destination=buf)
     except Exception:
-        # запасной путь через file_path
         try:
             tg_file = await bot.get_file(doc.file_id)
             await bot.download_file(tg_file.file_path, buf)
@@ -206,14 +226,17 @@ async def on_document(m: Message):
 
     # если есть оба — генерим
     if state.get("template") and state.get("codes"):
-        await m.reply("Собираю итоговый PDF… ⏳")
+        await m.reply("Собираю PNG-карточки… ⏳")
         try:
             ensure_font()
-            out_bytes = build_pdf(state["template"], state["codes"])
-            out = BytesIO(out_bytes)
-            out.name = "promo_cards.pdf"
-            await m.answer_document(types.BufferedInputFile(out.getvalue(), filename="promo_cards.pdf"))
-            # сбрасываем состояние (чтобы следующий запуск был чистым)
+            # 1) Сначала PDF со всеми страницами
+            pdf_bytes = build_pdf(state["template"], state["codes"])
+            # 2) Конвертируем PDF → ZIP(PNG)
+            zip_bytes = pdf_to_png_zip(pdf_bytes, dpi=300)  # при необходимости уменьшай dpi
+            await m.answer_document(
+                types.BufferedInputFile(zip_bytes, filename="promo_cards_png.zip")
+            )
+            # сбрасываем состояние
             USER_STATE[user_id] = {"template": None, "codes": None}
         except Exception as e:
             await m.reply(f"Упс, не собралось: {e}")
